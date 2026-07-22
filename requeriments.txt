@@ -1,8 +1,8 @@
-streamlit
-yfinance
-numpy
-pandas
-scipy
-holidays
-arch
-plotly
+streamlit==1.60.0
+yfinance==1.5.1
+numpy==2.5.1
+pandas==3.0.3
+scipy==1.18.0
+holidays==0.101
+arch==8.0.0
+plotly==6.9.0
