@@ -5,6 +5,8 @@ import pandas as pd
 from scipy.stats import norm
 from datetime import date, timedelta
 import holidays
+from arch import arch_model
+import plotly.graph_objects as go
 
 # ── Página ───────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -330,6 +332,60 @@ def calculate_garch11(
     return sigma_annual, sigma_annual * reducer
 
 
+def calculate_garch11_series(
+    returns: pd.Series,
+    n_init:  int   = 50,
+    alpha:   float = 0.05,
+    beta:    float = 0.90,
+):
+    """
+    Mesma recursão do calculate_garch11, mas devolve a SÉRIE completa de
+    vol. anualizada (uma por pregão), alinhada ao índice de `returns`.
+    """
+    if returns.empty or len(returns) < n_init + 2:
+        return None
+
+    res    = returns - returns.mean()
+    var_lp = res.iloc[:n_init].var(ddof=1)
+    omega  = max(var_lp * (1.0 - alpha - beta), 1e-10)
+
+    sigma2    = np.empty(len(res))
+    sigma2[0] = var_lp
+    for t in range(1, len(res)):
+        sigma2[t] = omega + alpha * (res.iloc[t - 1] ** 2) + beta * sigma2[t - 1]
+
+    sigma_annual_series = np.sqrt(np.maximum(sigma2, 1e-12)) * np.sqrt(252)
+    return pd.Series(sigma_annual_series, index=returns.index)
+
+
+def calculate_garch_t_student(returns: pd.Series):
+    """
+    GARCH(1,1) com distribuição t-Student (biblioteca `arch`).
+    Retorna: vol_atual, série anualizada dia a dia, nu, alpha, beta.
+    """
+    if returns.empty or len(returns) < 30:
+        return np.nan, None, np.nan, np.nan, np.nan
+
+    ret_pct = returns * 100.0
+    try:
+        modelo = arch_model(ret_pct, vol="Garch", p=1, q=1, dist="t", mean="Constant")
+        resultado = modelo.fit(disp="off")
+    except Exception:
+        return np.nan, None, np.nan, np.nan, np.nan
+
+    cond_vol_diaria_pct = resultado.conditional_volatility
+    serie_anual = (cond_vol_diaria_pct / 100.0) * np.sqrt(252)
+    serie_anual = pd.Series(serie_anual, index=ret_pct.index)
+
+    params = resultado.params
+    vol_atual = float(serie_anual.iloc[-1])
+    nu    = float(params.get("nu", np.nan))
+    alpha = float(params.get("alpha[1]", np.nan))
+    beta  = float(params.get("beta[1]", np.nan))
+
+    return vol_atual, serie_anual, nu, alpha, beta
+
+
 def calculate_business_days(start: date, end: date) -> int:
     br_h = holidays.Brazil(years=list(range(start.year, end.year + 1)))
     bd, cur = 0, start
@@ -409,25 +465,12 @@ with c1:
     ticker_input = st.text_input("Ticker (ex: PETR4.SA, VALE3.SA)",
                                   value="BOVA11.SA", key="ticker_input").upper()
 
-# ── Auto-fetch: roda sempre que o ticker muda (comparando com último ticker buscado) ──
 if st.session_state.get('last_fetched_ticker') != ticker_input:
     p_auto = get_stock_price(ticker_input)
     if p_auto:
         st.session_state.spot_price        = p_auto
-        st.session_state['spot_input']     = p_auto   # força atualização do widget
+        st.session_state['spot_input']     = p_auto
         st.session_state['last_fetched_ticker'] = ticker_input
-
-# with c2:
-#     st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-#     if st.button("↻ Atualizar Preço", key="btn_price"):
-#         p = get_stock_price(ticker_input)
-#         if p:
-#             st.session_state.spot_price    = p
-#             st.session_state['spot_input'] = p        # atualiza o campo diretamente
-#             st.session_state['last_fetched_ticker'] = ticker_input
-#             st.rerun()
-#         else:
-#             st.warning("Não foi possível obter o preço. Informe manualmente.")
 
 with c3:
     spot_price = st.number_input(
@@ -591,6 +634,9 @@ GARCH_REDUCER = 0.80
 
 hist_data  = get_historical_prices(ticker_input, period="1y")
 vol_annual = garch_raw = garch_red = None
+tstud_vol  = tstud_nu  = tstud_alpha = tstud_beta = None
+garch_series = garch_red_series = tstud_series = None
+hist_vol_series = None
 
 if not hist_data.empty and len(hist_data) > GARCH_N_INIT + 5:
     daily_returns = hist_data['Close'].pct_change().dropna()
@@ -602,7 +648,22 @@ if not hist_data.empty and len(hist_data) > GARCH_N_INIT + 5:
         reducer=GARCH_REDUCER,
     )
 
-vc1, vc2, vc3, vb1, vb2, vb3 = st.columns([2, 2, 2, 1.4, 1.4, 1.4])
+    garch_series = calculate_garch11_series(
+        daily_returns, n_init=GARCH_N_INIT, alpha=GARCH_ALPHA, beta=GARCH_BETA,
+    )
+    if garch_series is not None:
+        garch_red_series = garch_series * GARCH_REDUCER
+
+    # Vol. histórica em janela móvel de 63 pregões (≈ 3 meses) — compatível
+    # com o histórico de 1 ano baixado (252 exigiria 2 anos p/ ter série útil)
+    hist_vol_series = (daily_returns.rolling(window=63, min_periods=22)
+                                      .std(ddof=1) * np.sqrt(252))
+    if hist_vol_series.isna().all():
+        hist_vol_series = None
+
+    tstud_vol, tstud_series, tstud_nu, tstud_alpha, tstud_beta = calculate_garch_t_student(daily_returns)
+
+vc1, vc2, vc3, vc4, vb1, vb2, vb3 = st.columns([1.7, 1.7, 1.7, 1.7, 1.2, 1.2, 1.2])
 
 with vc1:
     v1 = f"{vol_annual * 100:.2f}%" if vol_annual is not None and not np.isnan(vol_annual) else "—"
@@ -628,6 +689,18 @@ with vc3:
       <div class="vol-value">{v3}</div>
     </div>""", unsafe_allow_html=True)
 
+with vc4:
+    v4 = f"{tstud_vol * 100:.2f}%" if tstud_vol is not None and not np.isnan(tstud_vol) else "—"
+    if tstud_nu is not None and not np.isnan(tstud_nu):
+        sub4 = f"ν={tstud_nu:.2f} α={tstud_alpha:.3f} β={tstud_beta:.3f}"
+    else:
+        sub4 = "dados insuficientes"
+    st.markdown(f"""
+    <div class="vol-card">
+      <div class="vol-label">GARCH(1,1) t-Student &nbsp;<small style='font-weight:400;color:#6a9e6a'>{sub4}</small></div>
+      <div class="vol-value">{v4}</div>
+    </div>""", unsafe_allow_html=True)
+
 with vb1:
     st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
     add_clicked = st.button("＋ Adicionar", key="btn_add")
@@ -639,6 +712,92 @@ with vb2:
 with vb3:
     st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
     clear_clicked = st.button("✕ Limpar", key="btn_clr")
+
+
+# ── Seleção de séries + gráfico: evolução da vol. anualizada no último ano ──
+
+st.markdown(
+    "<div style='font-size:11px;font-weight:700;color:#4a7a4a;text-transform:uppercase;"
+    "letter-spacing:0.6px;margin:14px 0 4px 0;'>Séries no gráfico</div>",
+    unsafe_allow_html=True,
+)
+sel1, sel2, sel3 = st.columns(3)
+with sel1:
+    show_hist = st.checkbox("Vol. Histórica", value=True, key="show_hist")
+with sel2:
+    show_garch = st.checkbox("GARCH(1,1)  (inclui ×80%)", value=True, key="show_garch")
+with sel3:
+    show_tstud = st.checkbox("GARCH(1,1) t-Student", value=True, key="show_tstud")
+
+# quantas CATEGORIAS (não linhas) estão ativas — usado para decidir se mostramos a média
+categorias_ativas = sum([show_hist, show_garch, show_tstud])
+
+selected_traces = []  # (nome, série, cor, dash)
+if show_hist and hist_vol_series is not None:
+    selected_traces.append(("Vol. Histórica a.a.", hist_vol_series, "#005f73", None))
+if show_garch and garch_series is not None:
+    selected_traces.append(("GARCH(1,1) custom", garch_series, "#2e9e4f", None))
+    if garch_red_series is not None:
+        selected_traces.append((f"GARCH × {int(GARCH_REDUCER*100)}%", garch_red_series, "#74cc91", "dash"))
+if show_tstud and tstud_series is not None:
+    selected_traces.append(("GARCH(1,1) t-Student", tstud_series, "#1a4a6e", None))
+
+if selected_traces:
+    fig = go.Figure()
+
+    for nome, serie, cor, dash in selected_traces:
+        line_style = dict(color=cor, width=2)
+        if dash:
+            line_style["dash"] = dash
+        fig.add_trace(go.Scatter(
+            x=serie.index, y=serie.values * 100,
+            mode="lines", name=nome, line=line_style,
+        ))
+
+    # ── Linha de média: só quando exatamente UMA categoria está selecionada ──
+    if categorias_ativas == 1:
+        serie_media, nome_media = None, None
+        if show_hist and hist_vol_series is not None:
+            serie_media, nome_media = hist_vol_series, "Vol. Histórica"
+        elif show_garch and garch_series is not None:
+            serie_media, nome_media = garch_series, "GARCH(1,1)"
+        elif show_tstud and tstud_series is not None:
+            serie_media, nome_media = tstud_series, "GARCH(1,1) t-Student"
+
+        if serie_media is not None:
+            media_pct = float(serie_media.mean()) * 100
+            fig.add_hline(
+                y=media_pct,
+                line_dash="dot", line_color="#e07b39", line_width=1.6,
+                annotation_text=f"Média {nome_media}: {media_pct:.2f}%",
+                annotation_position="top left",
+                annotation_font=dict(color="#e07b39", size=12, family="Roboto, sans-serif"),
+            )
+
+    fig.update_layout(
+        title=dict(text=f"Evolução da Volatilidade Anualizada — {ticker_input} (últimos 12 meses)",
+                   font=dict(family="Roboto, sans-serif", size=15, color="#1a1a1a")),
+        xaxis_title=None,
+        yaxis_title="Vol. anualizada (%)",
+        font=dict(family="Roboto, sans-serif", color="#1a1a1a"),
+        plot_bgcolor="#f6faf6",
+        paper_bgcolor="#ffffff",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=10, r=10, t=60, b=10),
+        height=420,
+        xaxis=dict(gridcolor="#e8f0e8"),
+        yaxis=dict(gridcolor="#e8f0e8", ticksuffix="%"),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+elif not hist_data.empty:
+    st.markdown(
+        '<div class="box-info">ℹ️ &nbsp;Selecione ao menos uma série acima para visualizar o gráfico '
+        '(ou verifique se há histórico suficiente para este ticker).</div>',
+        unsafe_allow_html=True
+    )
+
+st.markdown("---")
 
 
 # ── Lógica dos botões ─────────────────────────────────────────────────────
@@ -875,9 +1034,15 @@ with st.expander("📝  Notas e metodologia"):
 **Black–Scholes (1973)** — modelo de precificação para opções europeias sem dividendos.
 
 - **Dias úteis**: excluem fins de semana e feriados nacionais brasileiros (lib `holidays`).
-- **Base**: 252 dias úteis/ano.
+- **Base de anualização**: 252 dias úteis/ano.
+- **Vol. Histórica a.a.**: janela móvel de 63 pregões (≈3 meses), anualizada por √252.
 - **Theta** por dia útil; **Vega** e **Rho** por variação de 1%.
-- **GARCH(1,1)**: α = {GARCH_ALPHA} · β = {GARCH_BETA} · γ = {GARCH_GAMMA} · janela init = {GARCH_N_INIT} obs.
+- **GARCH(1,1) custom**: α = {GARCH_ALPHA} · β = {GARCH_BETA} · γ = {GARCH_GAMMA} · janela init = {GARCH_N_INIT} obs.
   ω = σ²_LP × (1 − α − β). O redutor de {int(GARCH_REDUCER*100)}% gera estimativa conservadora para uso como vol de entrada.
+- **GARCH(1,1) t-Student**: estimado via biblioteca `arch` (máxima verossimilhança), com inovações seguindo distribuição
+  t-Student em vez de normal — captura caudas mais pesadas, comuns em ações brasileiras. O parâmetro ν (graus de liberdade)
+  indica o quão "gordas" são as caudas: quanto menor, mais eventos extremos o modelo espera além da normal.
+- **Linha de média**: aparece no gráfico apenas quando uma única categoria de série está marcada
+  (Vol. Histórica OU GARCH(1,1) OU GARCH t-Student), mostrando a média da série selecionada no período.
 - Dados via **Yahoo Finance** (`yfinance`). Verifique a disponibilidade do ticker.
     """)
